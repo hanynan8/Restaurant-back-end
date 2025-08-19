@@ -12,34 +12,52 @@ const Navbar = mongoose.models.Navbar || mongoose.model('Navbar', schema, 'navba
 
 let isConnected = false;
 
-export default async function handler(req, res) {
-  if (!isConnected) {
-    await mongoose.connect(process.env.MONGO_URI);
-    isConnected = true;
+// ضع هنا الـ API Key الخاص بك
+const API_KEY = process.env.API_KEY;
+
+export default function handler(req, res) {
+  // التحقق من الـ API Key
+  const clientKey = req.headers['x-api-key'];
+  if (!clientKey || clientKey !== API_KEY) {
+    return res.status(401).json({ error: 'Unauthorized: Invalid API Key' });
   }
 
-  try {
-    const [homeData, footerData, aboutData, contactData, locationData, menuData, navbarData] =
-      await Promise.all([
-        Home.find({}),
-        Footer.find({}),
-        AboutUs.find({}),
-        Contact.find({}),
-        Location.find({}),
-        Menu.find({}),
-        Navbar.find({})
-      ]);
+  // الاتصال بـ MongoDB
+  const connectPromise = isConnected
+    ? Promise.resolve()
+    : mongoose.connect(process.env.MONGO_URI).then(() => { isConnected = true });
 
-    res.status(200).json({
-      home: homeData,
-      footer: footerData,
-      about: aboutData,
-      contact: contactData,
-      location: locationData,
-      menu: menuData,
-      navbar: navbarData
-    });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  connectPromise
+    .then(() => {
+      // تحديد الـ Collection اللي هنتعامل معها (مثال: home)
+      const collectionMap = {
+        home: Home,
+        footer: Footer,
+        about: AboutUs,
+        contact: Contact,
+        location: Location,
+        menu: Menu,
+        navbar: Navbar
+      };
+
+      const collectionName = req.query.collection; // ?collection=home
+      const Model = collectionMap[collectionName];
+
+      if (!Model) return res.status(400).json({ error: 'Invalid collection name' });
+
+      // التعامل مع كل Method
+      if (req.method === 'GET') {
+        return Model.find({});
+      } else if (req.method === 'POST') {
+        return Model.create(req.body);
+      } else if (req.method === 'PUT') {
+        return Model.findByIdAndUpdate(req.body.id, req.body, { new: true });
+      } else if (req.method === 'DELETE') {
+        return Model.findByIdAndDelete(req.body.id);
+      } else {
+        return Promise.reject(new Error('Method not allowed'));
+      }
+    })
+    .then(data => res.status(200).json(data))
+    .catch(err => res.status(500).json({ error: err.message }));
 }
