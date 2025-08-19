@@ -10,20 +10,17 @@ const Location = mongoose.models.Location || mongoose.model('Location', schema, 
 const Menu = mongoose.models.Menu || mongoose.model('Menu', schema, 'menu');
 const Navbar = mongoose.models.Navbar || mongoose.model('Navbar', schema, 'navbar');
 
-const collections = {
-  home: Home,
-  footer: Footer,
-  aboutus: AboutUs,
-  contact: Contact,
-  location: Location,
-  menu: Menu,
-  navbar: Navbar
+const collections = { 
+  home: Home, 
+  footer: Footer, 
+  aboutus: AboutUs, 
+  contact: Contact, 
+  location: Location, 
+  menu: Menu, 
+  navbar: Navbar 
 };
 
 let isConnected = false;
-
-// Optional API key: set process.env.API_KEY in Vercel if you want protection
-const API_KEY = process.env.API_KEY || '';
 
 function sendJson(res, status, payload) {
   res.setHeader('Content-Type', 'application/json');
@@ -31,31 +28,18 @@ function sendJson(res, status, payload) {
 }
 
 export default async function handler(req, res) {
-  // Basic CORS for testing from frontend (adjust in production)
+  // Basic CORS
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, x-api-key');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
-  if (req.method === 'OPTIONS') {
-    return res.status(204).end();
-  }
+  if (req.method === 'OPTIONS') return res.status(204).end();
 
-  // If API_KEY is set, require the client to send it
-  if (API_KEY) {
-    const clientKey = req.headers['x-api-key'];
-    if (!clientKey || clientKey !== API_KEY) {
-      return sendJson(res, 401, { error: 'Unauthorized: Invalid API Key' });
-    }
-  }
-
-  // ensure DB connection
   if (!isConnected) {
     try {
       await mongoose.connect(process.env.MONGO_URI);
       isConnected = true;
-      console.log('✅ MongoDB connected');
     } catch (err) {
-      console.error('❌ MongoDB connection error:', err);
       return sendJson(res, 500, { error: 'Database connection failed' });
     }
   }
@@ -64,9 +48,8 @@ export default async function handler(req, res) {
     const { method, query, body } = req;
     const { collection, id } = query;
 
-    // If no collection param -> return all collections (previous behaviour)
+    // لو مافيش collection، رجع كل الـ collections
     if (!collection) {
-      // return all collections in one object
       const results = await Promise.all(
         Object.keys(collections).map(key => collections[key].find({}))
       );
@@ -77,12 +60,12 @@ export default async function handler(req, res) {
       return sendJson(res, 200, payload);
     }
 
-    const key = collection.toString().toLowerCase();
+    const key = collection.toLowerCase();
     const Model = collections[key];
     if (!Model) return sendJson(res, 404, { error: 'Collection not found' });
 
     // validate id when required
-    const needsId = method === 'GET' && id || method === 'PUT' || method === 'DELETE';
+    const needsId = (method === 'GET' && id) || method === 'PUT' || method === 'DELETE';
     if (needsId && id && !mongoose.Types.ObjectId.isValid(id)) {
       return sendJson(res, 400, { error: 'Invalid id format' });
     }
@@ -97,7 +80,6 @@ export default async function handler(req, res) {
         return sendJson(res, 200, await Model.find({}));
 
       case 'POST':
-        // accept single object or array of objects
         if (Array.isArray(body)) {
           const created = await Model.insertMany(body);
           return sendJson(res, 201, created);
@@ -108,7 +90,6 @@ export default async function handler(req, res) {
 
       case 'PUT':
         if (!id) return sendJson(res, 400, { error: 'ID is required for PUT' });
-        // { new: true } returns updated doc
         const updated = await Model.findByIdAndUpdate(id, body, { new: true, runValidators: false });
         if (!updated) return sendJson(res, 404, { error: 'Document not found' });
         return sendJson(res, 200, updated);
@@ -117,14 +98,12 @@ export default async function handler(req, res) {
         if (!id) return sendJson(res, 400, { error: 'ID is required for DELETE' });
         const deleted = await Model.findByIdAndDelete(id);
         if (!deleted) return sendJson(res, 404, { error: 'Document not found' });
-        // return 204 No Content or 200 with deleted doc; here we return 200 with deleted doc
         return sendJson(res, 200, deleted);
 
       default:
         return sendJson(res, 405, { error: 'Method not allowed' });
     }
   } catch (err) {
-    console.error('Handler error:', err);
     return sendJson(res, 500, { error: err.message || 'Internal server error' });
   }
 }
