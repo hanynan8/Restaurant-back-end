@@ -4,17 +4,6 @@ import morgan from 'morgan';
 
 const app = express();
 
-// اتصال بالداتا بيز
-const dbURI =
-  "mongodb+srv://hanynan:hanynan@hanyscluster.xlpdssw.mongodb.net/Restaurant?retryWrites=true&w=majority&appName=HanysCluster";
-
-mongoose
-  .connect(dbURI)
-  .then(() => {
-    app.listen(3001, () => console.log('Connected to DB and listening on port 3001'));
-  })
-  .catch(err => console.log(err));
-
 // Middleware
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
@@ -30,6 +19,17 @@ const Contact = mongoose.model('Contact', schema, 'contact');
 const Location = mongoose.model('Location', schema, 'location');
 const Menu = mongoose.model('Menu', schema, 'menu');
 const Navbar = mongoose.model('Navbar', schema, 'navbar');
+
+// ====== MongoDB Connection ======
+const dbURI = process.env.DB_URI;
+
+mongoose
+  .connect(dbURI)
+  .then(() => {
+    const port = process.env.PORT || 3001;
+    app.listen(port, () => console.log(`Connected to DB and listening on port ${port}`));
+  })
+  .catch(err => console.error('Error connecting to DB:', err.message));
 
 // ====== Route API واحد لكل البيانات ======
 app.get('/api/data', (req, res) => {
