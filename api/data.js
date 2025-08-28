@@ -1,7 +1,8 @@
 import mongoose from 'mongoose';
 
-// Dynamic Next.js / Express-style API handler for MongoDB collections
-// - Automatically lists collections when no `collection` query param is provided
+// Enhanced Next.js / Express-style API handler for MongoDB collections
+// - Supports both query params (?collection=name) and path-based routing (/api/collections/users)
+// - Automatically lists collections when no collection is specified
 // - Creates Mongoose models on the fly with strict: false (accepts any fields)
 // - Supports GET (list or single), POST (create / insertMany), PUT (update by id), DELETE (delete by id)
 // - Basic CORS included
@@ -34,6 +35,50 @@ function getModelForCollection(collectionName) {
   return model;
 }
 
+// Extract collection name from URL path or query params
+function extractCollectionInfo(req) {
+  const { query } = req;
+  
+  // Method 1: From query params (?collection=users&id=123)
+  if (query.collection) {
+    return {
+      collection: query.collection,
+      id: query.id
+    };
+  }
+  
+  // Method 2: From URL path segments
+  // Example paths:
+  // /api/collections -> list all collections
+  // /api/collections/users -> get all users
+  // /api/collections/users/123 -> get user with id 123
+  
+  // Check if we have dynamic route segments like [...slug]
+  if (query.slug && Array.isArray(query.slug)) {
+    const [collection, id] = query.slug;
+    return { collection, id };
+  }
+  
+  // Check for other common Next.js dynamic route patterns
+  // If using [collection].js -> query.collection will be the collection name
+  if (query.collection && !query.id) {
+    return {
+      collection: query.collection,
+      id: query.id
+    };
+  }
+  
+  // Check for [collection]/[id].js pattern
+  if (query.collection && query.id) {
+    return {
+      collection: query.collection,
+      id: query.id
+    };
+  }
+
+  return { collection: null, id: null };
+}
+
 export default async function handler(req, res) {
   // Basic CORS
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -54,8 +99,8 @@ export default async function handler(req, res) {
   }
 
   try {
-    const { method, query, body } = req;
-    const { collection, id } = query;
+    const { method, body } = req;
+    const { collection, id } = extractCollectionInfo(req);
 
     // If no collection specified -> return all collections + their docs
     if (!collection) {
@@ -114,10 +159,20 @@ export default async function handler(req, res) {
         }
 
         // support optional query params for pagination: ?limit=50&skip=0
+        const { query } = req;
         const limit = Math.min(parseInt(query.limit || '100', 10) || 100, 1000);
         const skip = parseInt(query.skip || '0', 10) || 0;
 
-        const docs = await Model.find({}).skip(skip).limit(limit).lean();
+        // Support additional filtering via query params
+        const filter = {};
+        Object.keys(query).forEach(key => {
+          // Skip system params
+          if (!['collection', 'id', 'limit', 'skip', 'slug'].includes(key)) {
+            filter[key] = query[key];
+          }
+        });
+
+        const docs = await Model.find(filter).skip(skip).limit(limit).lean();
         return sendJson(res, 200, docs);
       }
 
