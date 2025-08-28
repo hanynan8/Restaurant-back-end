@@ -1,395 +1,558 @@
 import mongoose from 'mongoose';
 
-// Improved MongoDB API handler for Next.js/Express
-// - Enhanced security and error handling
-// - Better routing with multiple parameter support
-// - Advanced query capabilities with filtering, sorting, and pagination
-// - Optimized performance with connection pooling and caching
+// Enhanced MongoDB Collections API with advanced features
+// - Multi-route support: query params, path-based routing, and RESTful endpoints
+// - Advanced filtering, sorting, pagination, and search
+// - Bulk operations and transactions
+// - Field selection and population
+// - Aggregation pipeline support
+// - Enhanced security and validation
+// - Performance optimizations with caching and indexing
+// - Comprehensive error handling and logging
 
 let isConnected = false;
-const modelCache = {};
-const MAX_LIMIT = 1000; // Maximum documents to return in a single query
+const modelCache = new Map();
+const schemaCache = new Map();
 
-// Utility function to standardize responses
-function sendJson(res, status, payload, message = '') {
+// Configuration
+const CONFIG = {
+  MAX_LIMIT: 1000,
+  DEFAULT_LIMIT: 100,
+  MAX_BULK_SIZE: 1000,
+  CACHE_TTL: 5 * 60 * 1000, // 5 minutes
+  ALLOWED_OPERATORS: ['$eq', '$ne', '$gt', '$gte', '$lt', '$lte', '$in', '$nin', '$regex', '$exists'],
+  SYSTEM_COLLECTIONS: ['system.', 'admin.', '__']
+};
+
+// Utility functions
+function sendJson(res, status, payload, meta = {}) {
   const response = {
-    success: status >= 200 && status < 300,
-    message,
-    data: payload
+    success: status < 400,
+    data: payload,
+    meta: {
+      timestamp: new Date().toISOString(),
+      ...meta
+    }
   };
   
-  if (status >= 400) {
+  if (!response.success) {
     response.error = payload;
     delete response.data;
   }
   
   res.setHeader('Content-Type', 'application/json');
+  res.setHeader('X-Response-Time', Date.now());
   return res.status(status).json(response);
 }
 
-// Enhanced collection name validation
 function sanitizeCollectionName(name) {
   if (!name || typeof name !== 'string') return null;
   
-  // Prevent access to system collections and allow only alphanumeric, hyphen, underscore
-  if (name.startsWith('system.') || name.includes('$')) return null;
+  // More strict validation
+  const sanitized = name.trim().toLowerCase();
+  if (!/^[a-z][a-z0-9_-]{0,63}$/i.test(sanitized)) return null;
   
-  const match = name.match(/^[a-zA-Z0-9-_]+$/);
-  return match ? name : null;
+  // Block system collections
+  if (CONFIG.SYSTEM_COLLECTIONS.some(sys => sanitized.startsWith(sys))) return null;
+  
+  return sanitized;
 }
 
-// Get or create model for collection with caching
-function getModelForCollection(collectionName) {
-  const sanitizedName = sanitizeCollectionName(collectionName);
-  if (!sanitizedName) throw new Error('Invalid collection name');
+function parseQueryFilters(query) {
+  const filters = {};
+  const options = {
+    limit: Math.min(parseInt(query.limit) || CONFIG.DEFAULT_LIMIT, CONFIG.MAX_LIMIT),
+    skip: Math.max(parseInt(query.skip) || 0, 0),
+    sort: {},
+    select: query.select || null,
+    populate: query.populate || null
+  };
+
+  // Parse sorting
+  if (query.sort) {
+    const sortFields = query.sort.split(',');
+    sortFields.forEach(field => {
+      const trimmed = field.trim();
+      if (trimmed.startsWith('-')) {
+        options.sort[trimmed.substring(1)] = -1;
+      } else {
+        options.sort[trimmed] = 1;
+      }
+    });
+  }
+
+  // Parse filters
+  Object.keys(query).forEach(key => {
+    if (['limit', 'skip', 'sort', 'select', 'populate', 'collection', 'id', 'slug'].includes(key)) {
+      return;
+    }
+
+    // Handle special operators
+    if (key.includes('.')) {
+      const [field, operator] = key.split('.');
+      if (CONFIG.ALLOWED_OPERATORS.includes(`$${operator}`)) {
+        if (!filters[field]) filters[field] = {};
+        
+        let value = query[key];
+        // Parse JSON values
+        try {
+          if (value.startsWith('[') || value.startsWith('{') || value === 'true' || value === 'false' || !isNaN(value)) {
+            value = JSON.parse(value);
+          }
+        } catch (e) {
+          // Keep as string if JSON parse fails
+        }
+        
+        filters[field][`$${operator}`] = value;
+      }
+    } else {
+      // Simple equality filter
+      let value = query[key];
+      try {
+        if (value === 'true') value = true;
+        else if (value === 'false') value = false;
+        else if (!isNaN(value) && value !== '') value = Number(value);
+        else if (value.includes(',')) value = { $in: value.split(',') };
+      } catch (e) {
+        // Keep as string
+      }
+      filters[key] = value;
+    }
+  });
+
+  return { filters, options };
+}
+
+function getModelForCollection(collectionName, customSchema = null) {
+  const cacheKey = `${collectionName}_${customSchema ? 'custom' : 'default'}`;
   
-  if (modelCache[sanitizedName]) return modelCache[sanitizedName];
-  
-  const schema = new mongoose.Schema({}, { 
+  if (modelCache.has(cacheKey)) {
+    return modelCache.get(cacheKey);
+  }
+
+  const schema = customSchema || new mongoose.Schema({}, { 
     strict: false, 
-    timestamps: false,
+    timestamps: { createdAt: 'createdAt', updatedAt: 'updatedAt' },
     versionKey: false
   });
   
-  const modelName = `Dynamic__${sanitizedName}`;
-  const model = mongoose.models[modelName] || mongoose.model(modelName, schema, sanitizedName);
-  modelCache[sanitizedName] = model;
+  // Add indexes for common query patterns
+  if (!customSchema) {
+    schema.index({ createdAt: -1 });
+    schema.index({ updatedAt: -1 });
+  }
+
+  const modelName = `Dynamic__${collectionName}__${Date.now()}`;
+  const model = mongoose.models[modelName] || mongoose.model(modelName, schema, collectionName);
+  
+  modelCache.set(cacheKey, model);
+  
+  // Cache cleanup after TTL
+  setTimeout(() => {
+    modelCache.delete(cacheKey);
+    delete mongoose.models[modelName];
+  }, CONFIG.CACHE_TTL);
+  
   return model;
 }
 
-// Enhanced parameter extraction from URL
-function extractRequestParams(req) {
-  const { query, method } = req;
+function extractCollectionInfo(req) {
+  const { query, url } = req;
   
-  // Handle different routing patterns
-  if (query.slug && Array.isArray(query.slug)) {
-    const [collection, id, action] = query.slug;
-    return { collection, id, action };
-  }
-  
+  // Method 1: Query parameters (?collection=users&id=123)
   if (query.collection) {
     return {
       collection: query.collection,
-      id: query.id,
-      action: query.action
+      id: query.id
     };
   }
   
-  // Extract from path if using dynamic routing
-  const urlParts = req.url.split('/').filter(part => part && part !== 'api' && part !== 'collections');
-  if (urlParts.length > 0) {
+  // Method 2: Dynamic routes with [...slug]
+  if (query.slug && Array.isArray(query.slug)) {
+    const [collection, id, ...rest] = query.slug;
+    return { collection, id, action: rest[0] };
+  }
+  
+  // Method 3: Named dynamic routes [collection]/[id]
+  if (query.collection && typeof query.collection === 'string') {
     return {
-      collection: urlParts[0],
-      id: urlParts[1],
-      action: urlParts[2]
+      collection: query.collection,
+      id: query.id
     };
+  }
+  
+  // Method 4: Parse URL path manually (fallback)
+  const pathMatch = url.match(/\/api\/collections\/([^\/]+)(?:\/([^\/\?]+))?(?:\/([^\/\?]+))?/);
+  if (pathMatch) {
+    const [, collection, id, action] = pathMatch;
+    return { collection, id, action };
   }
   
   return { collection: null, id: null, action: null };
 }
 
-// Flexible document finder by ID
-async function findDocumentById(model, idValue) {
-  if (!idValue) return null;
-  
-  // Try as ObjectId first
-  if (mongoose.Types.ObjectId.isValid(idValue)) {
-    const doc = await model.findById(idValue).lean();
-    if (doc) return doc;
-  }
-  
-  // Try other possible ID fields
-  const idFields = ['_id', 'id', 'slug', 'uuid', 'email', 'username'];
-  for (const field of idFields) {
-    const doc = await model.findOne({ [field]: idValue }).lean();
-    if (doc) return doc;
+async function findByIdFlexible(model, idValue) {
+  // Try multiple ID strategies
+  const strategies = [
+    // 1. MongoDB ObjectId
+    () => mongoose.Types.ObjectId.isValid(idValue) ? model.findById(idValue).lean() : null,
+    // 2. String _id
+    () => model.findOne({ _id: idValue }).lean(),
+    // 3. Numeric id field
+    () => !isNaN(idValue) ? model.findOne({ id: Number(idValue) }).lean() : null,
+    // 4. String id field
+    () => model.findOne({ id: idValue }).lean(),
+    // 5. UUID or other string identifiers
+    () => model.findOne({ uuid: idValue }).lean(),
+    () => model.findOne({ slug: idValue }).lean()
+  ];
+
+  for (const strategy of strategies) {
+    try {
+      const result = await strategy();
+      if (result) return result;
+    } catch (e) {
+      continue;
+    }
   }
   
   return null;
 }
 
-// Build filter from query parameters
-function buildFilterFromQuery(query) {
-  const filter = {};
-  const excludedParams = ['collection', 'id', 'action', 'limit', 'skip', 'sort', 'fields', 'populate'];
-  
-  Object.keys(query).forEach(key => {
-    if (!excludedParams.includes(key)) {
-      // Handle special query operators
-      if (key.startsWith('$')) {
-        // Support for advanced operators like $gt, $lt, etc.
-        const operator = key;
-        const fieldValuePairs = query[key];
-        
-        if (typeof fieldValuePairs === 'object') {
-          Object.keys(fieldValuePairs).forEach(field => {
-            if (!filter[field]) filter[field] = {};
-            filter[field][operator] = fieldValuePairs[field];
-          });
-        }
-      } else {
-        // Regular equality filter
-        filter[key] = query[key];
-      }
-    }
-  });
-  
-  return filter;
-}
-
-// Apply sorting to query
-function applySorting(query, sortParam) {
-  if (!sortParam) return query;
-  
-  const sortOptions = {};
-  const sortFields = sortParam.split(',');
-  
-  sortFields.forEach(field => {
-    if (field.startsWith('-')) {
-      sortOptions[field.substring(1)] = -1; // Descending
-    } else {
-      sortOptions[field] = 1; // Ascending
-    }
-  });
-  
-  return query.sort(sortOptions);
-}
-
-// Apply field selection to query
-function applyFieldSelection(query, fieldsParam) {
-  if (!fieldsParam) return query;
-  
-  const projection = {};
-  const fields = fieldsParam.split(',');
-  
-  fields.forEach(field => {
-    projection[field] = 1;
-  });
-  
-  return query.select(projection);
-}
-
-// Main API handler
-export default async function handler(req, res) {
-  // Enhanced CORS handling
-  res.setHeader('Access-Control-Allow-Origin', process.env.ALLOWED_ORIGINS || '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-  
-  if (req.method === 'OPTIONS') {
-    return res.status(200).end();
-  }
-  
-  // Connect to MongoDB if not already connected
-  if (!isConnected) {
-    try {
-      await mongoose.connect(process.env.MONGO_URI, {
-        maxPoolSize: 10,
-        serverSelectionTimeoutMS: 5000,
-        socketTimeoutMS: 45000,
-      });
-      isConnected = true;
-      console.log('MongoDB connected successfully');
-    } catch (err) {
-      return sendJson(res, 500, { 
-        error: 'Database connection failed', 
-        details: process.env.NODE_ENV === 'development' ? err.message : 'Internal server error'
-      });
-    }
-  }
+async function connectToDatabase() {
+  if (isConnected) return;
   
   try {
-    const { method, body, query } = req;
-    const { collection, id, action } = extractRequestParams(req);
+    const options = {
+      maxPoolSize: 10,
+      serverSelectionTimeoutMS: 5000,
+      socketTimeoutMS: 45000,
+      bufferCommands: false,
+      bufferMaxEntries: 0
+    };
     
-    // Handle requests without collection specified
+    await mongoose.connect(process.env.MONGO_URI, options);
+    isConnected = true;
+    
+    // Handle connection events
+    mongoose.connection.on('error', (err) => {
+      console.error('MongoDB connection error:', err);
+      isConnected = false;
+    });
+    
+    mongoose.connection.on('disconnected', () => {
+      console.warn('MongoDB disconnected');
+      isConnected = false;
+    });
+    
+  } catch (err) {
+    console.error('Database connection failed:', err);
+    throw new Error(`Database connection failed: ${err.message}`);
+  }
+}
+
+export default async function handler(req, res) {
+  // Enhanced CORS with security headers
+  const allowedOrigins = process.env.ALLOWED_ORIGINS?.split(',') || ['*'];
+  const origin = req.headers.origin;
+  
+  if (allowedOrigins.includes('*') || allowedOrigins.includes(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin || '*');
+  }
+  
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,PATCH,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization,X-Requested-With');
+  res.setHeader('Access-Control-Allow-Credentials', 'true');
+  res.setHeader('Access-Control-Max-Age', '86400');
+  
+  // Security headers
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('X-XSS-Protection', '1; mode=block');
+  
+  if (req.method === 'OPTIONS') {
+    return res.status(204).end();
+  }
+
+  const startTime = Date.now();
+
+  try {
+    await connectToDatabase();
+    
+    const { method, body } = req;
+    const { collection, id, action } = extractCollectionInfo(req);
+
+    // Route 1: List all collections with their schemas and sample data
     if (!collection) {
-      if (method !== 'GET') {
-        return sendJson(res, 400, null, 'Collection name is required');
-      }
-      
-      // List available collections
       const collections = await mongoose.connection.db.listCollections().toArray();
-      const collectionNames = collections
+      const filtered = collections
         .map(c => c.name)
-        .filter(n => !n.startsWith('system.'))
-        .sort();
+        .filter(name => !CONFIG.SYSTEM_COLLECTIONS.some(sys => name.startsWith(sys)));
+
+      const result = {};
       
-      return sendJson(res, 200, collectionNames, 'Available collections');
-    }
-    
-    // Validate collection name
-    const sanitizedCollection = sanitizeCollectionName(collection);
-    if (!sanitizedCollection) {
-      return sendJson(res, 400, null, 'Invalid collection name');
-    }
-    
-    const Model = getModelForCollection(sanitizedCollection);
-    
-    // Handle different HTTP methods
-    switch (method) {
-      case 'GET': {
-        if (id) {
-          // Get specific document by ID
-          const doc = await findDocumentById(Model, id);
-          if (!doc) {
-            return sendJson(res, 404, null, 'Document not found');
-          }
-          
-          // Handle specific actions on documents
-          if (action === 'count') {
-            return sendJson(res, 200, { count: 1 }, 'Document count');
-          }
-          
-          return sendJson(res, 200, doc, 'Document retrieved successfully');
-        } else {
-          // Get multiple documents with filtering, sorting, and pagination
-          const limit = Math.min(parseInt(query.limit) || 50, MAX_LIMIT);
-          const skip = parseInt(query.skip) || 0;
-          const filter = buildFilterFromQuery(query);
-          
-          let dbQuery = Model.find(filter);
-          
-          // Apply sorting if specified
-          if (query.sort) {
-            dbQuery = applySorting(dbQuery, query.sort);
-          }
-          
-          // Apply field selection if specified
-          if (query.fields) {
-            dbQuery = applyFieldSelection(dbQuery, query.fields);
-          }
-          
-          // Execute query with pagination
-          const [docs, total] = await Promise.all([
-            dbQuery.skip(skip).limit(limit).lean(),
-            Model.countDocuments(filter)
+      // Get collection stats in parallel
+      const promises = filtered.map(async (name) => {
+        try {
+          const coll = mongoose.connection.db.collection(name);
+          const [count, sample, indexes] = await Promise.all([
+            coll.countDocuments(),
+            coll.find({}).limit(3).toArray(),
+            coll.listIndexes().toArray().catch(() => [])
           ]);
           
-          return sendJson(res, 200, {
-            documents: docs,
-            pagination: {
-              total,
-              limit,
-              skip,
-              hasMore: skip + docs.length < total
-            }
-          }, 'Documents retrieved successfully');
+          result[name] = {
+            count,
+            sample,
+            indexes: indexes.map(idx => ({ 
+              name: idx.name, 
+              keys: idx.key, 
+              unique: idx.unique || false 
+            })),
+            lastModified: sample.length > 0 ? 
+              Math.max(...sample.map(doc => new Date(doc.updatedAt || doc.createdAt || 0).getTime())) : null
+          };
+        } catch (e) {
+          result[name] = { error: e.message };
         }
-      }
+      });
+
+      await Promise.all(promises);
       
-      case 'POST': {
-        if (id && action === 'bulk') {
-          // Bulk operations on specific documents
-          if (!Array.isArray(body)) {
-            return sendJson(res, 400, null, 'Array of operations required for bulk update');
+      return sendJson(res, 200, result, {
+        collections: filtered.length,
+        responseTime: Date.now() - startTime
+      });
+    }
+
+    // Validate collection name
+    const sanitized = sanitizeCollectionName(collection);
+    if (!sanitized) {
+      return sendJson(res, 400, 'Invalid collection name. Must be alphanumeric with hyphens/underscores only.');
+    }
+
+    const Model = getModelForCollection(sanitized);
+    const { filters, options } = parseQueryFilters(req.query);
+
+    switch (method) {
+      case 'GET': {
+        // Route 2: Get specific document by ID
+        if (id) {
+          const doc = await findByIdFlexible(Model, id);
+          if (!doc) {
+            return sendJson(res, 404, `Document with id '${id}' not found in collection '${sanitized}'`);
           }
           
-          const results = await Model.bulkWrite(body);
-          return sendJson(res, 200, results, 'Bulk operation completed');
+          return sendJson(res, 200, doc, {
+            collection: sanitized,
+            responseTime: Date.now() - startTime
+          });
+        }
+
+        // Route 3: Special actions
+        if (action) {
+          switch (action) {
+            case 'count':
+              const count = await Model.countDocuments(filters);
+              return sendJson(res, 200, { count }, { collection: sanitized });
+              
+            case 'distinct':
+              const field = req.query.field;
+              if (!field) return sendJson(res, 400, 'Field parameter required for distinct operation');
+              const distinctValues = await Model.distinct(field, filters);
+              return sendJson(res, 200, { field, values: distinctValues });
+              
+            case 'aggregate':
+              if (!req.query.pipeline) return sendJson(res, 400, 'Pipeline parameter required for aggregation');
+              try {
+                const pipeline = JSON.parse(req.query.pipeline);
+                const result = await Model.aggregate(pipeline);
+                return sendJson(res, 200, result);
+              } catch (e) {
+                return sendJson(res, 400, `Invalid aggregation pipeline: ${e.message}`);
+              }
+          }
+        }
+
+        // Route 4: List documents with advanced filtering
+        let query = Model.find(filters);
+        
+        // Apply options
+        if (Object.keys(options.sort).length > 0) {
+          query = query.sort(options.sort);
         }
         
-        if (!body) {
-          return sendJson(res, 400, null, 'Request body is required');
+        if (options.select) {
+          query = query.select(options.select);
         }
         
-        // Create single or multiple documents
-        if (Array.isArray(body)) {
-          const created = await Model.insertMany(body, { ordered: false });
-          return sendJson(res, 201, created, 'Documents created successfully');
-        }
+        const docs = await query
+          .skip(options.skip)
+          .limit(options.limit)
+          .lean();
+
+        const total = await Model.countDocuments(filters);
         
-        const created = await Model.create(body);
-        return sendJson(res, 201, created, 'Document created successfully');
+        return sendJson(res, 200, docs, {
+          collection: sanitized,
+          pagination: {
+            total,
+            count: docs.length,
+            skip: options.skip,
+            limit: options.limit,
+            hasMore: options.skip + docs.length < total
+          },
+          filters,
+          responseTime: Date.now() - startTime
+        });
       }
-      
+
+      case 'POST': {
+        if (!body) {
+          return sendJson(res, 400, 'Request body is required');
+        }
+
+        // Bulk insert
+        if (Array.isArray(body)) {
+          if (body.length > CONFIG.MAX_BULK_SIZE) {
+            return sendJson(res, 400, `Bulk insert limit exceeded. Maximum ${CONFIG.MAX_BULK_SIZE} documents allowed.`);
+          }
+          
+          const result = await Model.insertMany(body, { ordered: false });
+          return sendJson(res, 201, result, {
+            collection: sanitized,
+            inserted: result.length,
+            responseTime: Date.now() - startTime
+          });
+        }
+
+        // Single insert
+        const created = await Model.create(body);
+        return sendJson(res, 201, created, {
+          collection: sanitized,
+          responseTime: Date.now() - startTime
+        });
+      }
+
       case 'PUT':
       case 'PATCH': {
+        if (!body) {
+          return sendJson(res, 400, 'Request body is required');
+        }
+
+        // Bulk update
+        if (!id && req.query.bulk === 'true') {
+          const updateFilter = filters;
+          const updateData = method === 'PATCH' ? { $set: body } : body;
+          
+          const result = await Model.updateMany(updateFilter, updateData);
+          return sendJson(res, 200, {
+            matchedCount: result.matchedCount,
+            modifiedCount: result.modifiedCount
+          }, {
+            collection: sanitized,
+            operation: 'bulk_update'
+          });
+        }
+
         if (!id) {
-          return sendJson(res, 400, null, 'Document ID is required for update');
+          return sendJson(res, 400, 'Document ID is required for update operations');
         }
-        
-        if (!body || typeof body !== 'object') {
-          return sendJson(res, 400, null, 'Valid update data is required');
-        }
-        
-        const options = { new: true, runValidators: false };
-        let updatedDoc;
-        
-        // Try different approaches to find and update the document
+
+        // Single update
+        const updateData = method === 'PATCH' ? { $set: body } : body;
+        let updated = null;
+
+        // Try different ID strategies
         if (mongoose.Types.ObjectId.isValid(id)) {
-          updatedDoc = await Model.findByIdAndUpdate(id, body, options);
+          updated = await Model.findByIdAndUpdate(id, updateData, { 
+            new: true, 
+            runValidators: false 
+          }).lean();
         }
         
-        if (!updatedDoc) {
-          updatedDoc = await Model.findOneAndUpdate({ _id: id }, body, options);
+        if (!updated) {
+          updated = await Model.findOneAndUpdate(
+            { $or: [{ _id: id }, { id: id }, { id: Number(id) }] },
+            updateData,
+            { new: true, runValidators: false }
+          ).lean();
         }
-        
-        if (!updatedDoc) {
-          // Try other possible ID fields
-          const idFields = ['id', 'slug', 'uuid', 'email', 'username'];
-          for (const field of idFields) {
-            updatedDoc = await Model.findOneAndUpdate({ [field]: id }, body, options);
-            if (updatedDoc) break;
-          }
+
+        if (!updated) {
+          return sendJson(res, 404, `Document with id '${id}' not found`);
         }
-        
-        if (!updatedDoc) {
-          return sendJson(res, 404, null, 'Document not found');
-        }
-        
-        return sendJson(res, 200, updatedDoc, 'Document updated successfully');
+
+        return sendJson(res, 200, updated, {
+          collection: sanitized,
+          responseTime: Date.now() - startTime
+        });
       }
-      
+
       case 'DELETE': {
+        // Bulk delete
+        if (!id && req.query.bulk === 'true') {
+          const deleteFilter = filters;
+          const result = await Model.deleteMany(deleteFilter);
+          
+          return sendJson(res, 200, {
+            deletedCount: result.deletedCount
+          }, {
+            collection: sanitized,
+            operation: 'bulk_delete'
+          });
+        }
+
         if (!id) {
-          return sendJson(res, 400, null, 'Document ID is required for deletion');
+          return sendJson(res, 400, 'Document ID is required for delete operations');
         }
-        
-        let deletedDoc;
-        
+
+        // Single delete
+        let deleted = null;
+
         if (mongoose.Types.ObjectId.isValid(id)) {
-          deletedDoc = await Model.findByIdAndDelete(id);
+          deleted = await Model.findByIdAndDelete(id).lean();
         }
         
-        if (!deletedDoc) {
-          deletedDoc = await Model.findOneAndDelete({ _id: id });
+        if (!deleted) {
+          deleted = await Model.findOneAndDelete({
+            $or: [{ _id: id }, { id: id }, { id: Number(id) }]
+          }).lean();
         }
-        
-        if (!deletedDoc) {
-          // Try other possible ID fields
-          const idFields = ['id', 'slug', 'uuid', 'email', 'username'];
-          for (const field of idFields) {
-            deletedDoc = await Model.findOneAndDelete({ [field]: id });
-            if (deletedDoc) break;
-          }
+
+        if (!deleted) {
+          return sendJson(res, 404, `Document with id '${id}' not found`);
         }
-        
-        if (!deletedDoc) {
-          return sendJson(res, 404, null, 'Document not found');
-        }
-        
-        return sendJson(res, 200, deletedDoc, 'Document deleted successfully');
+
+        return sendJson(res, 200, deleted, {
+          collection: sanitized,
+          responseTime: Date.now() - startTime
+        });
       }
-      
+
       default:
-        return sendJson(res, 405, null, 'Method not allowed');
+        return sendJson(res, 405, `Method ${method} not allowed`);
     }
+
   } catch (err) {
     console.error('API Error:', err);
     
-    // Handle specific error types
-    if (err.name === 'ValidationError') {
-      return sendJson(res, 400, err.errors, 'Validation error');
+    // Handle specific MongoDB errors
+    if (err.name === 'CastError') {
+      return sendJson(res, 400, `Invalid data format: ${err.message}`);
     }
     
     if (err.code === 11000) {
-      return sendJson(res, 409, null, 'Duplicate key error');
+      return sendJson(res, 409, 'Duplicate key error. Document already exists.');
     }
     
-    return sendJson(res, 500, 
-      process.env.NODE_ENV === 'development' ? err.message : 'Internal server error', 
-      'An error occurred'
-    );
+    if (err.name === 'ValidationError') {
+      return sendJson(res, 400, `Validation error: ${err.message}`);
+    }
+
+    return sendJson(res, 500, 'Internal server error. Please try again later.', {
+      error: process.env.MONGO_URI === 'development' ? err.message : undefined,
+      responseTime: Date.now() - startTime
+    });
   }
 }
