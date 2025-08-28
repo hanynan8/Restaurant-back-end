@@ -100,9 +100,60 @@ export default async function handler(req, res) {
       // 2) try _id as string
       let doc = await model.findOne({ _id: idValue }).lean();
       if (doc) return doc;
-      // 3) try field `id` fallback
-      doc = await model.findOne({ id: idValue }).lean();
-      return doc;
+      // 3) try field `id` fallback (match number or string)
+      // attempt numeric conversion for comparison
+      const maybeNum = Number(idValue);
+      const idQueryNumber = !Number.isNaN(maybeNum) ? maybeNum : undefined;
+      doc = await model.findOne({ $or: [{ id: idValue }, { id: idQueryNumber } ] }).lean();
+      if (doc) return doc;
+
+      // 4) FALLBACK: search inside documents recursively for nested `id` or `id2`
+      //    (this scans documents in the collection and returns all matched nested items)
+      const results = [];
+
+      function searchRecursive(obj) {
+        if (obj == null) return;
+        if (Array.isArray(obj)) {
+          for (const el of obj) {
+            searchRecursive(el);
+          }
+          return;
+        }
+        if (typeof obj === 'object') {
+          for (const [k, v] of Object.entries(obj)) {
+            // check keys named 'id' or 'id2'
+            if ((k === 'id' || k === 'id2')) {
+              // compare loosely (string/number)
+              if (String(v) === String(idValue) || (idQueryNumber !== undefined && v === idQueryNumber)) {
+                // push the matched value's parent object (if available) or the primitive
+                // If v is primitive, push { key: k, value: v } — but most cases v is primitive and parent object is of interest
+                // We try to find the parent object context by returning the containing object itself
+                results.push(obj);
+              }
+            }
+            // recurse into nested structures
+            if (v && (typeof v === 'object' || Array.isArray(v))) {
+              searchRecursive(v);
+            }
+          }
+        }
+      }
+
+      // limit scan to avoid huge collections; tweak limit if you need deeper scan
+      const cursorDocs = await model.find({}).limit(1000).lean();
+      for (const d of cursorDocs) {
+        searchRecursive(d);
+      }
+
+      if (results.length > 0) {
+        return results; // return array of matched nested objects (could be items inside arrays)
+      }
+
+      // last fallback: try field named 'id2' on top-level doc
+      doc = await model.findOne({ $or: [{ id2: idValue }, { id2: idQueryNumber }] }).lean();
+      if (doc) return doc;
+
+      return null;
     }
 
     switch (method) {
